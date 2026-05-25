@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import logging
 import math
+from contextvars import ContextVar
 from functools import wraps
 from typing import Any
 
@@ -26,6 +27,10 @@ SETTINGS_ATTR = "_condelta_low_cfg_negative_settings"
 BASE_APPLIED_ATTR = "_condelta_low_cfg_negative_base_marker"
 HR_APPLIED_ATTR = "_condelta_low_cfg_negative_hr_marker"
 PATCH_ATTR = "_condelta_low_cfg_negative_original"
+FORGE_COUPLE_CONTEXT: ContextVar[dict[str, Any] | None] = ContextVar(
+    "condelta_low_cfg_negative_forge_couple_context",
+    default=None,
+)
 
 DELTA_KEYS = ("crossattn", "cross_attn", "vector", "pooled_output")
 
@@ -281,6 +286,42 @@ def _apply_conditioning_delta(base: Any, negative: Any, blank: Any, strength: fl
     return base
 
 
+def _apply_delta_to_nested_conditioning(base: Any, negative: Any, blank: Any, strength: float):
+    updated = _apply_conditioning_delta(base, negative, blank, strength)
+    if updated is not base:
+        return updated
+
+    if isinstance(base, list) and isinstance(negative, list) and isinstance(blank, list):
+        if not base or not negative or not blank:
+            return base
+
+        return [
+            _apply_delta_to_nested_conditioning(
+                item,
+                negative[min(index, len(negative) - 1)],
+                blank[min(index, len(blank) - 1)],
+                strength,
+            )
+            for index, item in enumerate(base)
+        ]
+
+    if isinstance(base, tuple) and isinstance(negative, tuple) and isinstance(blank, tuple):
+        if not base or not negative or not blank:
+            return base
+
+        return tuple(
+            _apply_delta_to_nested_conditioning(
+                item,
+                negative[min(index, len(negative) - 1)],
+                blank[min(index, len(blank) - 1)],
+                strength,
+            )
+            for index, item in enumerate(base)
+        )
+
+    return base
+
+
 def _merge_delta_schedule(base_schedules, negative_schedules, blank_schedules, strength: float):
     endpoints = sorted(
         {
@@ -450,6 +491,194 @@ def _apply_condelta_pass(p, is_hr: bool) -> None:
 
     _record_generation_params(p, cfg, settings, is_hr, kept_native)
     setattr(p, marker_attr, _marker(new_cond, getattr(p, uc_attr, None), cfg, settings, negative_prompts))
+
+
+def _fit_prompts_to_count(prompts: list[str], count: int) -> list[str]:
+    if count <= 0:
+        return []
+
+    if not prompts:
+        return [""] * count
+
+    if len(prompts) == count:
+        return prompts
+
+    if len(prompts) == 1:
+        return prompts * count
+
+    return [prompts[min(index, len(prompts) - 1)] for index in range(count)]
+
+
+def _make_conditioning_like(template: Any, prompts: list[str], is_negative_prompt: bool):
+    return prompt_parser.SdConditioning(
+        prompts,
+        width=getattr(template, "width", None),
+        height=getattr(template, "height", None),
+        copy_from=template,
+        distilled_cfg_scale=getattr(template, "distilled_cfg_scale", None),
+        is_negative_prompt=is_negative_prompt,
+    )
+
+
+def _forge_couple_negative_prompts(p, texts: Any, is_hr: bool) -> tuple[list[str], float, dict[str, Any]] | None:
+    settings = _get_settings(p)
+    mode = settings["mode"]
+    cfg_attr = "hr_cfg" if is_hr else "cfg_scale"
+    prompts_attr = "hr_negative_prompts" if is_hr else "negative_prompts"
+    cfg = _as_float(getattr(p, cfg_attr, DEFAULT_THRESHOLD), DEFAULT_THRESHOLD, 0.0, 1000.0)
+
+    try:
+        count = len(texts)
+    except TypeError:
+        count = 1
+
+    if mode == MODE_DEDICATED:
+        prompt = str(settings["dedicated_prompt"] or "")
+        if not prompt.strip():
+            return None
+
+        return _fit_prompts_to_count([prompt], count), cfg, settings
+
+    negative_prompts = _listify_prompts(getattr(p, prompts_attr, None))
+    if cfg > float(settings["threshold"]) or not _has_negative_text(negative_prompts):
+        return None
+
+    return _fit_prompts_to_count(negative_prompts, count), cfg, settings
+
+
+def _forge_couple_reference_conds(
+    context: dict[str, Any],
+    sd_model: Any,
+    texts: Any,
+    original_text2cond,
+    negative_prompts: list[str],
+    p,
+):
+    blank_is_negative = not _model_uses_sdxl_zero_negative(p)
+    cache = context.setdefault("reference_cache", {})
+    key = (
+        id(sd_model),
+        tuple(negative_prompts),
+        getattr(texts, "width", None),
+        getattr(texts, "height", None),
+        getattr(texts, "distilled_cfg_scale", None),
+        blank_is_negative,
+    )
+
+    if key not in cache:
+        blank_prompts = [""] * len(negative_prompts)
+        negative_texts = _make_conditioning_like(texts, negative_prompts, is_negative_prompt=True)
+        blank_texts = _make_conditioning_like(texts, blank_prompts, is_negative_prompt=blank_is_negative)
+        cache[key] = (
+            original_text2cond(sd_model, negative_texts),
+            original_text2cond(sd_model, blank_texts),
+        )
+
+    return cache[key]
+
+
+def _apply_condelta_to_forge_couple_cond(base_cond: Any, sd_model: Any, texts: Any, original_text2cond):
+    context = FORGE_COUPLE_CONTEXT.get()
+    if context is None:
+        return base_cond
+
+    p = context.get("p")
+    if p is None:
+        return base_cond
+
+    prompt_info = _forge_couple_negative_prompts(p, texts, bool(context.get("is_hr")))
+    if prompt_info is None:
+        return base_cond
+
+    negative_prompts, _cfg, settings = prompt_info
+    if not negative_prompts:
+        return base_cond
+
+    negative_cond, blank_cond = _forge_couple_reference_conds(
+        context,
+        sd_model,
+        texts,
+        original_text2cond,
+        negative_prompts,
+        p,
+    )
+    return _apply_delta_to_nested_conditioning(
+        base_cond,
+        negative_cond,
+        blank_cond,
+        float(settings["strength"]),
+    )
+
+
+def _ensure_forge_couple_text2cond_patch() -> bool:
+    try:
+        from lib_couple import mapping as couple_mapping
+    except Exception:
+        return False
+
+    text2cond = getattr(couple_mapping, "text2cond", None)
+    if text2cond is None:
+        return False
+
+    if getattr(text2cond, PATCH_ATTR, None):
+        return True
+
+    original_text2cond = text2cond
+
+    @wraps(original_text2cond)
+    def text2cond_wrapper(sd_model, texts):
+        base_cond = original_text2cond(sd_model, texts)
+        try:
+            return _apply_condelta_to_forge_couple_cond(base_cond, sd_model, texts, original_text2cond)
+        except Exception:
+            logger.exception("ConDelta low-CFG negative failed during Forge Couple region conditioning")
+            return base_cond
+
+    setattr(text2cond_wrapper, PATCH_ATTR, original_text2cond)
+    couple_mapping.text2cond = text2cond_wrapper
+    return True
+
+
+def _is_forge_couple_script(script: Any) -> bool:
+    if script.__class__.__name__ == "ForgeCouple":
+        return True
+
+    try:
+        return script.title() == "Forge Couple"
+    except Exception:
+        return False
+
+
+def _patch_forge_couple_script(script: Any) -> None:
+    process_before_every_sampling = getattr(script, "process_before_every_sampling", None)
+    if process_before_every_sampling is None or getattr(process_before_every_sampling, PATCH_ATTR, None):
+        return
+
+    @wraps(process_before_every_sampling)
+    def process_before_every_sampling_wrapper(p, *args, **kwargs):
+        if not _ensure_forge_couple_text2cond_patch():
+            return process_before_every_sampling(p, *args, **kwargs)
+
+        token = FORGE_COUPLE_CONTEXT.set(
+            {
+                "p": p,
+                "is_hr": bool(getattr(script, "is_hr", False)),
+            }
+        )
+        try:
+            return process_before_every_sampling(p, *args, **kwargs)
+        finally:
+            FORGE_COUPLE_CONTEXT.reset(token)
+
+    setattr(process_before_every_sampling_wrapper, PATCH_ATTR, process_before_every_sampling)
+    script.process_before_every_sampling = process_before_every_sampling_wrapper
+
+
+def _patch_forge_couple_instances(p) -> None:
+    scripts_obj = getattr(p, "scripts", None)
+    for script in getattr(scripts_obj, "alwayson_scripts", []) or []:
+        if _is_forge_couple_script(script):
+            _patch_forge_couple_script(script)
 
 
 def _patch_processing_methods() -> None:
@@ -623,6 +852,7 @@ class Script(scripts.Script):
             SETTINGS_ATTR,
             settings,
         )
+        _patch_forge_couple_instances(p)
 
 
 _patch_processing_methods()
