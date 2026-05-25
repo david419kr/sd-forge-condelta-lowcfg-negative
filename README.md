@@ -5,7 +5,7 @@ Forge Neo always-on extension for ConDelta-style negative prompting.
 Settings include `ConDelta prompt mode`:
 
 - `Seamless` keeps the existing Negative Prompt field workflow.
-- `Dedicated Prompt` adds a separate one-line `ConDelta negative prompt` field
+- `Dedicated Prompt` adds a separate initially one-line `ConDelta negative prompt` field
   below the native Negative Prompt field.
 
 In `Seamless` mode, the extension adds a normal extension accordion named
@@ -17,8 +17,9 @@ In `Seamless` mode, the extension adds a normal extension accordion named
     if you want the UI control itself to expose a wider range
 - `Also use native negative prompt above CFG 1.0`, default off
 
-In `Dedicated Prompt` mode, the accordion only shows `ConDelta strength`. The
-dedicated prompt field controls whether ConDelta is applied.
+In `Dedicated Prompt` mode, the native Negative Prompt field starts at two
+lines, the accordion only shows `ConDelta strength`, and the dedicated prompt
+field controls whether ConDelta is applied.
 
 When active, the positive conditioning is changed as:
 

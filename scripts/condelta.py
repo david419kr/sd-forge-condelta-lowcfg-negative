@@ -727,7 +727,6 @@ def _create_dedicated_prompt_row(id_part: str) -> gr.Textbox:
             elem_id=f"{id_part}_condelta_negative_prompt",
             show_label=False,
             lines=1,
-            max_lines=1,
             placeholder="ConDelta negative prompt",
             elem_classes=["prompt", "condelta-negative-prompt"],
         )
@@ -745,6 +744,8 @@ def _on_after_component(component, **kwargs) -> None:
         _create_dedicated_prompt_row("txt2img")
     elif elem_id == "img2img_neg_prompt_row":
         _create_dedicated_prompt_row("img2img")
+    elif elem_id in ("txt2img_neg_prompt", "img2img_neg_prompt"):
+        component.lines = 2
 
 
 script_callbacks.on_after_component(_on_after_component)
