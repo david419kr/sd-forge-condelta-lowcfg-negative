@@ -8,13 +8,19 @@ from typing import Any
 import gradio as gr
 import torch
 
-from modules import devices, processing, prompt_parser, scripts, shared
+from modules import devices, processing, prompt_parser, script_callbacks, scripts, shared
 
 
 TITLE = "ConDelta low-CFG negative"
+SECTION = ("condelta", "ConDelta")
 
 DEFAULT_THRESHOLD = 1.0
 DEFAULT_STRENGTH = 0.6
+
+OPT_PROMPT_MODE = "condelta_prompt_mode"
+MODE_SEAMLESS = "Seamless"
+MODE_DEDICATED = "Dedicated Prompt"
+MODE_CHOICES = (MODE_SEAMLESS, MODE_DEDICATED)
 
 SETTINGS_ATTR = "_condelta_low_cfg_negative_settings"
 BASE_APPLIED_ATTR = "_condelta_low_cfg_negative_base_marker"
@@ -23,7 +29,25 @@ PATCH_ATTR = "_condelta_low_cfg_negative_original"
 
 DELTA_KEYS = ("crossattn", "cross_attn", "vector", "pooled_output")
 
+_DEDICATED_COMPONENTS: dict[str, gr.components.Component] = {}
+
 logger = logging.getLogger(__name__)
+
+
+def _register_settings() -> None:
+    shared.opts.add_option(
+        OPT_PROMPT_MODE,
+        shared.OptionInfo(
+            MODE_SEAMLESS,
+            "ConDelta prompt mode",
+            gr.Radio,
+            {"choices": MODE_CHOICES},
+            section=SECTION,
+        ).needs_reload_ui(),
+    )
+
+
+script_callbacks.on_ui_settings(_register_settings)
 
 
 def _as_float(value: Any, default: float, minimum: float, maximum: float) -> float:
@@ -42,15 +66,30 @@ def _as_bool(value: Any, default: bool = False) -> bool:
     return default if value is None else bool(value)
 
 
+def _prompt_mode() -> str:
+    value = getattr(shared.opts, OPT_PROMPT_MODE, MODE_SEAMLESS)
+    return value if value in MODE_CHOICES else MODE_SEAMLESS
+
+
+def _is_dedicated_mode() -> bool:
+    return _prompt_mode() == MODE_DEDICATED
+
+
 def _get_settings(p) -> dict[str, Any]:
     settings = getattr(p, SETTINGS_ATTR, None)
     if not isinstance(settings, dict):
         settings = {}
 
+    mode = settings.get("mode") or _prompt_mode()
+    if mode not in MODE_CHOICES:
+        mode = MODE_SEAMLESS
+
     return {
+        "mode": mode,
         "threshold": _as_float(settings.get("threshold"), DEFAULT_THRESHOLD, 1.0, 24.0),
         "strength": _as_float(settings.get("strength"), DEFAULT_STRENGTH, 0.0, 1.0),
         "also_native": _as_bool(settings.get("also_native"), False),
+        "dedicated_prompt": str(settings.get("dedicated_prompt") or ""),
     }
 
 
@@ -121,6 +160,14 @@ def _pass_steps(p, cond: Any, is_hr: bool) -> tuple[int, int | None]:
 
 def _model_uses_sdxl_zero_negative(p) -> bool:
     return bool(getattr(getattr(p, "sd_model", None), "is_sdxl", False))
+
+
+def _dedicated_prompts_for_batch(prompt: str, cond: Any) -> list[str]:
+    batch_size = 1
+    if isinstance(cond, prompt_parser.MulticondLearnedConditioning):
+        batch_size = max(len(cond.batch), 1)
+
+    return [prompt] * batch_size
 
 
 def _encode_prompt_schedules(
@@ -288,6 +335,7 @@ def _marker(cond: Any, uc: Any, cfg: float, settings: dict[str, Any], prompts: l
     return (
         id(cond),
         id(uc),
+        settings["mode"],
         round(float(cfg), 8),
         round(float(settings["threshold"]), 8),
         round(float(settings["strength"]), 8),
@@ -298,6 +346,12 @@ def _marker(cond: Any, uc: Any, cfg: float, settings: dict[str, Any], prompts: l
 
 def _record_generation_params(p, cfg: float, settings: dict[str, Any], is_hr: bool, kept_native: bool) -> None:
     prefix = "Hires " if is_hr else ""
+    if settings["mode"] == MODE_DEDICATED:
+        p.extra_generation_params[f"{prefix}ConDelta low-CFG negative"] = MODE_DEDICATED
+        p.extra_generation_params[f"{prefix}ConDelta strength"] = settings["strength"]
+        p.extra_generation_params[f"{prefix}ConDelta negative prompt"] = settings["dedicated_prompt"]
+        return
+
     mode = "Native negative + ConDelta" if kept_native else "ConDelta only"
 
     p.extra_generation_params[f"{prefix}ConDelta low-CFG negative"] = mode
@@ -313,6 +367,7 @@ def _apply_condelta_pass(p, is_hr: bool) -> None:
     threshold = float(settings["threshold"])
     strength = float(settings["strength"])
     also_native = bool(settings["also_native"])
+    mode = settings["mode"]
 
     cond_attr = "hr_c" if is_hr else "c"
     uc_attr = "hr_uc" if is_hr else "uc"
@@ -321,15 +376,22 @@ def _apply_condelta_pass(p, is_hr: bool) -> None:
     marker_attr = HR_APPLIED_ATTR if is_hr else BASE_APPLIED_ATTR
 
     cfg = _as_float(getattr(p, cfg_attr, DEFAULT_THRESHOLD), DEFAULT_THRESHOLD, 0.0, 1000.0)
-    negative_prompts = _listify_prompts(getattr(p, prompts_attr, None))
-
-    if cfg > threshold or not _has_negative_text(negative_prompts):
-        return
 
     cond = getattr(p, cond_attr, None)
     if not isinstance(cond, prompt_parser.MulticondLearnedConditioning):
         logger.debug("Skipping ConDelta: unsupported %s conditioning type %s", cond_attr, type(cond).__name__)
         return
+
+    if mode == MODE_DEDICATED:
+        prompt = str(settings["dedicated_prompt"] or "")
+        if not prompt.strip():
+            return
+
+        negative_prompts = _dedicated_prompts_for_batch(prompt, cond)
+    else:
+        negative_prompts = _listify_prompts(getattr(p, prompts_attr, None))
+        if cfg > threshold or not _has_negative_text(negative_prompts):
+            return
 
     uc = getattr(p, uc_attr, None)
     current_marker = _marker(cond, uc, cfg, settings, negative_prompts)
@@ -367,7 +429,9 @@ def _apply_condelta_pass(p, is_hr: bool) -> None:
     setattr(p, cond_attr, new_cond)
 
     kept_native = False
-    if _is_cfg_one(cfg):
+    if mode == MODE_DEDICATED:
+        kept_native = getattr(p, uc_attr, None) is not None
+    elif _is_cfg_one(cfg):
         setattr(p, uc_attr, None)
     elif also_native:
         kept_native = True
@@ -420,6 +484,39 @@ def _patch_processing_methods() -> None:
         processing.StableDiffusionProcessingTxt2Img.calculate_hr_conds = calculate_hr_conds_wrapper
 
 
+def _create_dedicated_prompt_row(id_part: str) -> gr.Textbox:
+    with gr.Row(
+        elem_id=f"{id_part}_condelta_negative_prompt_row",
+        elem_classes=["prompt-row", "condelta-negative-prompt-row"],
+    ):
+        prompt = gr.Textbox(
+            label="ConDelta negative prompt",
+            elem_id=f"{id_part}_condelta_negative_prompt",
+            show_label=False,
+            lines=1,
+            max_lines=1,
+            placeholder="ConDelta negative prompt",
+            elem_classes=["prompt", "condelta-negative-prompt"],
+        )
+
+    _DEDICATED_COMPONENTS[id_part] = prompt
+    return prompt
+
+
+def _on_after_component(component, **kwargs) -> None:
+    if not _is_dedicated_mode():
+        return
+
+    elem_id = getattr(component, "elem_id", None)
+    if elem_id == "txt2img_neg_prompt_row":
+        _create_dedicated_prompt_row("txt2img")
+    elif elem_id == "img2img_neg_prompt_row":
+        _create_dedicated_prompt_row("img2img")
+
+
+script_callbacks.on_after_component(_on_after_component)
+
+
 class Script(scripts.Script):
     def title(self):
         return TITLE
@@ -429,6 +526,35 @@ class Script(scripts.Script):
 
     def ui(self, is_img2img):
         tab = "img2img" if is_img2img else "txt2img"
+        mode = _prompt_mode()
+
+        if mode == MODE_DEDICATED:
+            dedicated_prompt = _DEDICATED_COMPONENTS.get(tab)
+            if dedicated_prompt is None:
+                dedicated_prompt = gr.Textbox(
+                    label="ConDelta negative prompt",
+                    elem_id=f"{tab}_condelta_negative_prompt_hidden",
+                    visible=False,
+                )
+
+            with gr.Accordion(label=TITLE, open=False, elem_id=f"{tab}_condelta_low_cfg_negative"):
+                strength = gr.Slider(
+                    minimum=0.0,
+                    maximum=1.0,
+                    step=0.05,
+                    value=DEFAULT_STRENGTH,
+                    label="ConDelta strength",
+                    elem_id=f"{tab}_condelta_strength",
+                    scale=1,
+                )
+
+            self.infotext_fields = [
+                (dedicated_prompt, "ConDelta negative prompt"),
+                (strength, "ConDelta strength"),
+            ]
+            self.paste_field_names = [name for _, name in self.infotext_fields]
+
+            return [dedicated_prompt, strength]
 
         with gr.Accordion(label=TITLE, open=False, elem_id=f"{tab}_condelta_low_cfg_negative"):
             with gr.Row():
@@ -467,15 +593,35 @@ class Script(scripts.Script):
 
         return [threshold, strength, also_native]
 
-    def process(self, p, threshold=DEFAULT_THRESHOLD, strength=DEFAULT_STRENGTH, also_native=False):
-        setattr(
-            p,
-            SETTINGS_ATTR,
-            {
+    def process(self, p, *args):
+        mode = _prompt_mode()
+
+        if mode == MODE_DEDICATED:
+            dedicated_prompt = args[0] if len(args) > 0 else ""
+            strength = args[1] if len(args) > 1 else DEFAULT_STRENGTH
+            settings = {
+                "mode": MODE_DEDICATED,
+                "threshold": DEFAULT_THRESHOLD,
+                "strength": _as_float(strength, DEFAULT_STRENGTH, 0.0, 1.0),
+                "also_native": False,
+                "dedicated_prompt": str(dedicated_prompt or ""),
+            }
+        else:
+            threshold = args[0] if len(args) > 0 else DEFAULT_THRESHOLD
+            strength = args[1] if len(args) > 1 else DEFAULT_STRENGTH
+            also_native = args[2] if len(args) > 2 else False
+            settings = {
+                "mode": MODE_SEAMLESS,
                 "threshold": _as_float(threshold, DEFAULT_THRESHOLD, 1.0, 24.0),
                 "strength": _as_float(strength, DEFAULT_STRENGTH, 0.0, 1.0),
                 "also_native": _as_bool(also_native, False),
-            },
+                "dedicated_prompt": "",
+            }
+
+        setattr(
+            p,
+            SETTINGS_ATTR,
+            settings,
         )
 
 
