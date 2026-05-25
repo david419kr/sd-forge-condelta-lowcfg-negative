@@ -17,6 +17,10 @@ SECTION = ("condelta", "ConDelta")
 
 DEFAULT_THRESHOLD = 1.0
 DEFAULT_STRENGTH = 0.6
+STRENGTH_INPUT_MIN = -100.0
+STRENGTH_INPUT_MAX = 100.0
+STRENGTH_SLIDER_MIN = 0.0
+STRENGTH_SLIDER_MAX = 2.0
 
 OPT_PROMPT_MODE = "condelta_prompt_mode"
 MODE_SEAMLESS = "Seamless"
@@ -92,7 +96,7 @@ def _get_settings(p) -> dict[str, Any]:
     return {
         "mode": mode,
         "threshold": _as_float(settings.get("threshold"), DEFAULT_THRESHOLD, 1.0, 24.0),
-        "strength": _as_float(settings.get("strength"), DEFAULT_STRENGTH, 0.0, 1.0),
+        "strength": _as_float(settings.get("strength"), DEFAULT_STRENGTH, STRENGTH_INPUT_MIN, STRENGTH_INPUT_MAX),
         "also_native": _as_bool(settings.get("also_native"), False),
         "dedicated_prompt": str(settings.get("dedicated_prompt") or ""),
     }
@@ -768,8 +772,8 @@ class Script(scripts.Script):
 
             with gr.Accordion(label=TITLE, open=False, elem_id=f"{tab}_condelta_low_cfg_negative"):
                 strength = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
+                    minimum=STRENGTH_SLIDER_MIN,
+                    maximum=STRENGTH_SLIDER_MAX,
                     step=0.05,
                     value=DEFAULT_STRENGTH,
                     label="ConDelta strength",
@@ -798,8 +802,8 @@ class Script(scripts.Script):
                 )
 
                 strength = gr.Slider(
-                    minimum=0.0,
-                    maximum=1.0,
+                    minimum=STRENGTH_SLIDER_MIN,
+                    maximum=STRENGTH_SLIDER_MAX,
                     step=0.05,
                     value=DEFAULT_STRENGTH,
                     label="ConDelta strength",
@@ -831,7 +835,7 @@ class Script(scripts.Script):
             settings = {
                 "mode": MODE_DEDICATED,
                 "threshold": DEFAULT_THRESHOLD,
-                "strength": _as_float(strength, DEFAULT_STRENGTH, 0.0, 1.0),
+                "strength": _as_float(strength, DEFAULT_STRENGTH, STRENGTH_INPUT_MIN, STRENGTH_INPUT_MAX),
                 "also_native": False,
                 "dedicated_prompt": str(dedicated_prompt or ""),
             }
@@ -842,7 +846,7 @@ class Script(scripts.Script):
             settings = {
                 "mode": MODE_SEAMLESS,
                 "threshold": _as_float(threshold, DEFAULT_THRESHOLD, 1.0, 24.0),
-                "strength": _as_float(strength, DEFAULT_STRENGTH, 0.0, 1.0),
+                "strength": _as_float(strength, DEFAULT_STRENGTH, STRENGTH_INPUT_MIN, STRENGTH_INPUT_MAX),
                 "also_native": _as_bool(also_native, False),
                 "dedicated_prompt": "",
             }

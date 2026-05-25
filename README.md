@@ -12,7 +12,9 @@ In `Seamless` mode, the extension adds a normal extension accordion named
 `ConDelta low-CFG negative` with:
 
 - `Activation CFG threshold`, default `1.0`, range `1.0..24.0`, step `0.5`
-- `ConDelta strength`, default `0.6`, range `0.0..1.0`, step `0.05`
+- `ConDelta strength`, default `0.6`, range `0.0..2.0`, step `0.05`
+  - backend values are accepted from `-100.0..100.0`; edit `ui-config.json`
+    if you want the UI control itself to expose a wider range
 - `Also use native negative prompt above CFG 1.0`, default off
 
 In `Dedicated Prompt` mode, the accordion only shows `ConDelta strength`. The
